@@ -42,8 +42,6 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
-				close(client.receive)
-				close(client.send)
 			}
 			h.mu.Unlock()
 		}
