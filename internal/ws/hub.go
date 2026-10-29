@@ -19,8 +19,8 @@ func NewHub(dispatcher *handler.Dispatcher) *Hub {
 	return &Hub{
 		mu:         sync.RWMutex{},
 		clients:    make(map[*Client]bool),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
+		register:   make(chan *Client, 16),
+		unregister: make(chan *Client, 16),
 		dispatcher: dispatcher,
 	}
 }
@@ -29,19 +29,23 @@ func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.register:
-			if client != nil {
-				h.clients[client] = true
+			if client == nil {
+				continue
 			}
+			h.mu.Lock()
+			h.clients[client] = true
+			h.mu.Unlock()
 		case client := <-h.unregister:
-			if client != nil {
-				h.mu.Lock()
-				if h.clients[client] {
-					delete(h.clients, client)
-					close(client.receive)
-					close(client.send)
-				}
-				h.mu.Unlock()
+			if client == nil {
+				continue
 			}
+			h.mu.Lock()
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.receive)
+				close(client.send)
+			}
+			h.mu.Unlock()
 		}
 	}
 }
@@ -59,6 +63,8 @@ func (h *Hub) SendTo(client *Client, message Response) bool {
 	}
 
 	select {
+	case <-client.done:
+		return false
 	case client.send <- message:
 		return true
 	default:
@@ -72,16 +78,24 @@ func (h *Hub) HandleMessage(ctx context.Context, client *Client) {
 		client.conn.Close()
 	}()
 
-	for msg := range client.receive {
-		result, err := h.dispatcher.Dispatch(ctx, msg)
+	for {
+		select {
+		case <-client.done:
+			return
+		case msg, ok := <-client.receive:
+			if !ok {
+				return
+			}
 
-		response := Response{}
-		if err != nil {
-			Error(err, &response)
-		} else {
-			Success(result, &response)
+			result, err := h.dispatcher.Dispatch(ctx, msg)
+			response := Response{}
+			if err != nil {
+				Error(err, &response)
+			} else {
+				Success(result, &response)
+			}
+
+			h.SendTo(client, response)
 		}
-
-		h.SendTo(client, response)
 	}
 }
