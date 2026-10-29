@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yoyojr404/internal/ws/handler"
 	"github.com/gorilla/websocket"
+	"github.com/yoyojr404/internal/ws/handler"
 )
 
 const (
@@ -21,6 +21,7 @@ type Client struct {
 	conn      *websocket.Conn
 	send      chan Response
 	receive   chan handler.Message
+	done      chan struct{}
 	closeOnce sync.Once
 }
 
@@ -30,12 +31,14 @@ func NewClient(hub *Hub, conn *websocket.Conn) *Client {
 		conn:      conn,
 		send:      make(chan Response, 256),
 		receive:   make(chan handler.Message, 10),
+		done:      make(chan struct{}),
 		closeOnce: sync.Once{},
 	}
 }
 
 func (c *Client) close() {
 	c.closeOnce.Do(func() {
+		close(c.done)
 		c.hub.unregister <- c
 	})
 }
@@ -45,14 +48,17 @@ func (c *Client) ReadPump() {
 		c.close()
 		c.conn.Close()
 	}()
+
 	c.conn.SetReadLimit(maxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
-	c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
 
 	for {
 		var msg handler.Message
 		err := c.conn.ReadJSON(&msg)
-
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(
 				err,
@@ -62,11 +68,12 @@ func (c *Client) ReadPump() {
 			) {
 				log.Printf("error: %v", err)
 			}
-
 			break
 		}
 
 		select {
+		case <-c.done:
+			return
 		case c.receive <- msg:
 		default:
 			log.Printf("receive channel full, dropping message")
@@ -76,7 +83,6 @@ func (c *Client) ReadPump() {
 
 func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
-
 	defer func() {
 		ticker.Stop()
 		c.close()
@@ -85,20 +91,19 @@ func (c *Client) WritePump() {
 
 	for {
 		select {
+		case <-c.done:
+			return
 		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
-			err := c.conn.WriteJSON(message)
-
-			if err != nil {
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteJSON(message); err != nil {
 				log.Printf("write error: %v", err)
 				return
 			}
-
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
